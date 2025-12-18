@@ -41,6 +41,9 @@ __global__ void fused_gemm_reduce_kernel(
     __shared__ half A_smem[BLOCK_TILE_M][BLOCK_TILE_K + SKEW_HALF];
     __shared__ half B_smem[BLOCK_TILE_K][BLOCK_TILE_N + SKEW_HALF];
     
+    // Shared memory for storing WMMA output fragments
+    __shared__ float C_smem[BLOCK_TILE_M][BLOCK_TILE_N + SKEW_HALF];
+    
     const int warp_id = threadIdx.x / 32;
     const int lane_id = threadIdx.x % 32;
     const int warp_row = warp_id / WARPS_N;
@@ -49,7 +52,7 @@ __global__ void fused_gemm_reduce_kernel(
     const int block_row = blockIdx.y;
     const int block_col = blockIdx.x;
     
-    // Each warp computes a 64x64 tile using 4x4 WMMA tiles
+    // Each warp computes tiles using WMMA
     const int num_wmma_tiles_m = BLOCK_TILE_M / WMMA_M / WARPS_M;
     const int num_wmma_tiles_n = BLOCK_TILE_N / WMMA_N / WARPS_N;
     
@@ -70,7 +73,6 @@ __global__ void fused_gemm_reduce_kernel(
     
     for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
         // Load input tile to shared memory (A_smem)
-        // Each thread loads multiple elements
         const int global_row_start = block_row * BLOCK_TILE_M;
         const int global_k_start = k_tile * BLOCK_TILE_K;
         
@@ -132,43 +134,48 @@ __global__ void fused_gemm_reduce_kernel(
         __syncthreads();
     }
     
-    // Store results and perform reduction + scaling
-    // Each warp writes its tiles and performs partial reduction
-    __shared__ float reduction_smem[BLOCK_TILE_M];
-    
-    if (threadIdx.x < BLOCK_TILE_M) {
-        reduction_smem[threadIdx.x] = 0.0f;
+    // Initialize C_smem to zero
+    for (int i = threadIdx.x; i < BLOCK_TILE_M * BLOCK_TILE_N; i += NUM_THREADS) {
+        int row = i / BLOCK_TILE_N;
+        int col = i % BLOCK_TILE_N;
+        C_smem[row][col] = 0.0f;
     }
     __syncthreads();
     
+    // Store WMMA fragments properly to shared memory
     #pragma unroll
     for (int i = 0; i < num_wmma_tiles_m; i++) {
         #pragma unroll
         for (int j = 0; j < num_wmma_tiles_n; j++) {
-            int global_row = block_row * BLOCK_TILE_M + warp_row * num_wmma_tiles_m * WMMA_M + i * WMMA_M;
-            int global_col = block_col * BLOCK_TILE_N + warp_col * num_wmma_tiles_n * WMMA_N + j * WMMA_N;
+            int frag_row = warp_row * num_wmma_tiles_m * WMMA_M + i * WMMA_M;
+            int frag_col = warp_col * num_wmma_tiles_n * WMMA_N + j * WMMA_N;
             
-            if (global_row < batch_size && global_col < hidden_size) {
-                // Apply division by 2 and accumulate for reduction
-                float frag_sum = 0.0f;
-                #pragma unroll
-                for (int elem = 0; elem < acc_frags[i][j].num_elements; elem++) {
-                    frag_sum += acc_frags[i][j].x[elem] * 0.5f;
-                }
-                
-                // Atomic add to shared memory for reduction
-                atomicAdd(&reduction_smem[warp_row * num_wmma_tiles_m * WMMA_M + i * WMMA_M + lane_id / 4], frag_sum);
-            }
+            // Store fragment to shared memory using proper WMMA store
+            wmma::store_matrix_sync(&C_smem[frag_row][frag_col], acc_frags[i][j], 
+                                   BLOCK_TILE_N + SKEW_HALF, wmma::mem_row_major);
         }
     }
     
     __syncthreads();
     
-    // Final reduction and write output
-    if (threadIdx.x < BLOCK_TILE_M) {
-        int global_row = block_row * BLOCK_TILE_M + threadIdx.x;
+    // Perform reduction across columns for each row
+    // Each thread handles one or more rows
+    for (int row = threadIdx.x; row < BLOCK_TILE_M; row += NUM_THREADS) {
+        int global_row = block_row * BLOCK_TILE_M + row;
         if (global_row < batch_size) {
-            atomicAdd(&output[global_row], reduction_smem[threadIdx.x] * scaling_factor);
+            float row_sum = 0.0f;
+            
+            // Sum across all columns in this block tile
+            for (int col = 0; col < BLOCK_TILE_N; col++) {
+                int global_col = block_col * BLOCK_TILE_N + col;
+                if (global_col < hidden_size) {
+                    // Apply division by 2 during reduction
+                    row_sum += C_smem[row][col] * 0.5f;
+                }
+            }
+            
+            // Atomic add to global output with scaling factor
+            atomicAdd(&output[global_row], row_sum * scaling_factor);
         }
     }
 }
