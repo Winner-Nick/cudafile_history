@@ -15,14 +15,14 @@ using namespace nvcuda;
 #define WMMA_N 16
 #define WMMA_K 16
 
-// Block tile sizes - reduced to fit in shared memory
-#define BLOCK_TILE_M 64
-#define BLOCK_TILE_N 64
+// Block tile sizes - reduced to fit in shared memory and reduce register pressure
+#define BLOCK_TILE_M 32
+#define BLOCK_TILE_N 32
 #define BLOCK_TILE_K 16
 
-// Warp configuration - reduced to decrease register pressure
-#define WARPS_M 2
-#define WARPS_N 2
+// Warp configuration - 1x1 to minimize register usage
+#define WARPS_M 1
+#define WARPS_N 1
 #define NUM_THREADS (WARPS_M * WARPS_N * 32)
 
 // Shared memory padding to avoid bank conflicts
@@ -48,110 +48,94 @@ __global__ void fused_gemm_kernel(
     const int block_row = blockIdx.y;
     const int block_col = blockIdx.x;
     
-    // Each warp computes tiles using WMMA
-    const int num_wmma_tiles_m = BLOCK_TILE_M / WMMA_M / WARPS_M;
-    const int num_wmma_tiles_n = BLOCK_TILE_N / WMMA_N / WARPS_N;
-    
-    // Accumulator fragments for this warp
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frags[num_wmma_tiles_m][num_wmma_tiles_n];
-    
-    // Initialize accumulators to zero
-    #pragma unroll
-    for (int i = 0; i < num_wmma_tiles_m; i++) {
-        #pragma unroll
-        for (int j = 0; j < num_wmma_tiles_n; j++) {
-            wmma::fill_fragment(acc_frags[i][j], 0.0f);
-        }
+    // Early exit if block is out of bounds
+    if (block_row * BLOCK_TILE_M >= batch_size || block_col * BLOCK_TILE_N >= hidden_size) {
+        return;
     }
+    
+    // Each warp computes tiles using WMMA
+    const int num_wmma_tiles_m = BLOCK_TILE_M / WMMA_M / WARPS_M;  // = 32/16/1 = 2
+    const int num_wmma_tiles_n = BLOCK_TILE_N / WMMA_N / WARPS_N;  // = 32/16/1 = 2
+    
+    // Accumulator fragments for this warp - process sequentially to reduce register pressure
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
     
     // Loop over K dimension in tiles
     const int num_k_tiles = (input_size + BLOCK_TILE_K - 1) / BLOCK_TILE_K;
     
-    for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
-        // Load input tile to shared memory (A_smem)
-        const int global_row_start = block_row * BLOCK_TILE_M;
-        const int global_k_start = k_tile * BLOCK_TILE_K;
-        
-        for (int i = threadIdx.x; i < BLOCK_TILE_M * BLOCK_TILE_K; i += NUM_THREADS) {
-            int local_row = i / BLOCK_TILE_K;
-            int local_k = i % BLOCK_TILE_K;
-            int global_row = global_row_start + local_row;
-            int global_k = global_k_start + local_k;
+    // Process each output tile sequentially
+    for (int tile_m = 0; tile_m < num_wmma_tiles_m; tile_m++) {
+        for (int tile_n = 0; tile_n < num_wmma_tiles_n; tile_n++) {
             
-            float val = 0.0f;
-            if (global_row < batch_size && global_k < input_size) {
-                val = input[global_row * input_size + global_k];
-            }
-            A_smem[local_row][local_k] = __float2half(val);
-        }
-        
-        // Load weight tile to shared memory (B_smem)
-        // Weight is [hidden_size, input_size], we need transpose
-        const int global_col_start = block_col * BLOCK_TILE_N;
-        
-        for (int i = threadIdx.x; i < BLOCK_TILE_K * BLOCK_TILE_N; i += NUM_THREADS) {
-            int local_k = i / BLOCK_TILE_N;
-            int local_col = i % BLOCK_TILE_N;
-            int global_k = global_k_start + local_k;
-            int global_col = global_col_start + local_col;
+            // Initialize accumulator to zero for this tile
+            wmma::fill_fragment(acc_frag, 0.0f);
             
-            float val = 0.0f;
-            if (global_col < hidden_size && global_k < input_size) {
-                val = weight[global_col * input_size + global_k];
-            }
-            B_smem[local_k][local_col] = __float2half(val);
-        }
-        
-        __syncthreads();
-        
-        // Perform WMMA operations
-        for (int k_step = 0; k_step < BLOCK_TILE_K / WMMA_K; k_step++) {
-            wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
-            wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag;
-            
-            #pragma unroll
-            for (int i = 0; i < num_wmma_tiles_m; i++) {
-                #pragma unroll
-                for (int j = 0; j < num_wmma_tiles_n; j++) {
-                    int a_row = warp_row * num_wmma_tiles_m * WMMA_M + i * WMMA_M;
-                    int b_col = warp_col * num_wmma_tiles_n * WMMA_N + j * WMMA_N;
+            for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
+                // Load input tile to shared memory (A_smem)
+                const int global_row_start = block_row * BLOCK_TILE_M;
+                const int global_k_start = k_tile * BLOCK_TILE_K;
+                
+                for (int i = threadIdx.x; i < BLOCK_TILE_M * BLOCK_TILE_K; i += NUM_THREADS) {
+                    int local_row = i / BLOCK_TILE_K;
+                    int local_k = i % BLOCK_TILE_K;
+                    int global_row = global_row_start + local_row;
+                    int global_k = global_k_start + local_k;
+                    
+                    float val = 0.0f;
+                    if (global_row < batch_size && global_k < input_size) {
+                        val = input[global_row * input_size + global_k];
+                    }
+                    A_smem[local_row][local_k] = __float2half(val);
+                }
+                
+                // Load weight tile to shared memory (B_smem)
+                // Weight is [hidden_size, input_size], we need transpose
+                const int global_col_start = block_col * BLOCK_TILE_N;
+                
+                for (int i = threadIdx.x; i < BLOCK_TILE_K * BLOCK_TILE_N; i += NUM_THREADS) {
+                    int local_k = i / BLOCK_TILE_N;
+                    int local_col = i % BLOCK_TILE_N;
+                    int global_k = global_k_start + local_k;
+                    int global_col = global_col_start + local_col;
+                    
+                    float val = 0.0f;
+                    if (global_col < hidden_size && global_k < input_size) {
+                        val = weight[global_col * input_size + global_k];
+                    }
+                    B_smem[local_k][local_col] = __float2half(val);
+                }
+                
+                __syncthreads();
+                
+                // Perform WMMA operations for this tile
+                for (int k_step = 0; k_step < BLOCK_TILE_K / WMMA_K; k_step++) {
+                    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
+                    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag;
+                    
+                    int a_row = warp_row * num_wmma_tiles_m * WMMA_M + tile_m * WMMA_M;
+                    int b_col = warp_col * num_wmma_tiles_n * WMMA_N + tile_n * WMMA_N;
                     int k_offset = k_step * WMMA_K;
                     
                     wmma::load_matrix_sync(a_frag, &A_smem[a_row][k_offset], BLOCK_TILE_K + SKEW_HALF);
                     wmma::load_matrix_sync(b_frag, &B_smem[k_offset][b_col], BLOCK_TILE_N + SKEW_HALF);
-                    wmma::mma_sync(acc_frags[i][j], a_frag, b_frag, acc_frags[i][j]);
+                    wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
                 }
+                
+                __syncthreads();
             }
-        }
-        
-        __syncthreads();
-    }
-    
-    // Store results directly to global memory
-    #pragma unroll
-    for (int i = 0; i < num_wmma_tiles_m; i++) {
-        #pragma unroll
-        for (int j = 0; j < num_wmma_tiles_n; j++) {
-            int frag_row = warp_row * num_wmma_tiles_m * WMMA_M + i * WMMA_M;
-            int frag_col = warp_col * num_wmma_tiles_n * WMMA_N + j * WMMA_N;
+            
+            // Store results directly to global memory using WMMA store
+            int frag_row = warp_row * num_wmma_tiles_m * WMMA_M + tile_m * WMMA_M;
+            int frag_col = warp_col * num_wmma_tiles_n * WMMA_N + tile_n * WMMA_N;
             
             int global_row = block_row * BLOCK_TILE_M + frag_row;
             int global_col = block_col * BLOCK_TILE_N + frag_col;
             
             if (global_row < batch_size && global_col < hidden_size) {
-                // Store fragment to global memory
-                float temp[WMMA_M * WMMA_N];
-                wmma::store_matrix_sync(temp, acc_frags[i][j], WMMA_N, wmma::mem_row_major);
-                
-                for (int ii = 0; ii < WMMA_M; ii++) {
-                    for (int jj = 0; jj < WMMA_N; jj++) {
-                        int gr = global_row + ii;
-                        int gc = global_col + jj;
-                        if (gr < batch_size && gc < hidden_size) {
-                            gemm_output[gr * hidden_size + gc] = temp[ii * WMMA_N + jj];
-                        }
-                    }
-                }
+                // Direct store using WMMA - no temporary array needed
+                wmma::store_matrix_sync(
+                    &gemm_output[global_row * hidden_size + global_col],
+                    acc_frag, hidden_size, wmma::mem_row_major);
             }
         }
     }
@@ -239,7 +223,8 @@ fused_module = load_inline(
         "-O3",
         "--use_fast_math",
         "-arch=sm_80",
-        "--ptxas-options=-v"
+        "--ptxas-options=-v",
+        "-lineinfo"
     ],
 )
 
