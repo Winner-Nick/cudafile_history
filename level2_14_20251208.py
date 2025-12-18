@@ -15,12 +15,12 @@ using namespace nvcuda;
 #define WMMA_N 16
 #define WMMA_K 16
 
-// Block tile sizes - reduced to fit in shared memory and reduce register pressure
+// Block tile sizes
 #define BLOCK_TILE_M 32
 #define BLOCK_TILE_N 32
 #define BLOCK_TILE_K 16
 
-// Warp configuration - 1x1 to minimize register usage
+// Warp configuration
 #define WARPS_M 1
 #define WARPS_N 1
 #define NUM_THREADS (WARPS_M * WARPS_N * 32)
@@ -57,9 +57,6 @@ __global__ void fused_gemm_kernel(
     const int num_wmma_tiles_m = BLOCK_TILE_M / WMMA_M / WARPS_M;  // = 32/16/1 = 2
     const int num_wmma_tiles_n = BLOCK_TILE_N / WMMA_N / WARPS_N;  // = 32/16/1 = 2
     
-    // Accumulator fragments for this warp - process sequentially to reduce register pressure
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
-    
     // Loop over K dimension in tiles
     const int num_k_tiles = (input_size + BLOCK_TILE_K - 1) / BLOCK_TILE_K;
     
@@ -67,7 +64,8 @@ __global__ void fused_gemm_kernel(
     for (int tile_m = 0; tile_m < num_wmma_tiles_m; tile_m++) {
         for (int tile_n = 0; tile_n < num_wmma_tiles_n; tile_n++) {
             
-            // Initialize accumulator to zero for this tile
+            // Accumulator fragment for this tile
+            wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
             wmma::fill_fragment(acc_frag, 0.0f);
             
             for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
@@ -112,8 +110,8 @@ __global__ void fused_gemm_kernel(
                     wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
                     wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag;
                     
-                    int a_row = warp_row * num_wmma_tiles_m * WMMA_M + tile_m * WMMA_M;
-                    int b_col = warp_col * num_wmma_tiles_n * WMMA_N + tile_n * WMMA_N;
+                    int a_row = tile_m * WMMA_M;
+                    int b_col = tile_n * WMMA_N;
                     int k_offset = k_step * WMMA_K;
                     
                     wmma::load_matrix_sync(a_frag, &A_smem[a_row][k_offset], BLOCK_TILE_K + SKEW_HALF);
@@ -124,18 +122,33 @@ __global__ void fused_gemm_kernel(
                 __syncthreads();
             }
             
-            // Store results directly to global memory using WMMA store
-            int frag_row = warp_row * num_wmma_tiles_m * WMMA_M + tile_m * WMMA_M;
-            int frag_col = warp_col * num_wmma_tiles_n * WMMA_N + tile_n * WMMA_N;
+            // Store results with proper boundary checking
+            int frag_row = tile_m * WMMA_M;
+            int frag_col = tile_n * WMMA_N;
             
             int global_row = block_row * BLOCK_TILE_M + frag_row;
             int global_col = block_col * BLOCK_TILE_N + frag_col;
             
-            if (global_row < batch_size && global_col < hidden_size) {
-                // Direct store using WMMA - no temporary array needed
+            // Check if the entire 16x16 tile fits within bounds
+            if (global_row + WMMA_M <= batch_size && global_col + WMMA_N <= hidden_size) {
+                // Safe to store full tile using WMMA
                 wmma::store_matrix_sync(
                     &gemm_output[global_row * hidden_size + global_col],
                     acc_frag, hidden_size, wmma::mem_row_major);
+            } else {
+                // Handle partial tiles by extracting elements individually
+                float output_vals[WMMA_M * WMMA_N];
+                wmma::store_matrix_sync(output_vals, acc_frag, WMMA_N, wmma::mem_row_major);
+                
+                for (int i = 0; i < WMMA_M; i++) {
+                    for (int j = 0; j < WMMA_N; j++) {
+                        int row_idx = global_row + i;
+                        int col_idx = global_col + j;
+                        if (row_idx < batch_size && col_idx < hidden_size) {
+                            gemm_output[row_idx * hidden_size + col_idx] = output_vals[i * WMMA_N + j];
+                        }
+                    }
+                }
             }
         }
     }
