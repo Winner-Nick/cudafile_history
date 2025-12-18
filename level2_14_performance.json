@@ -1,0 +1,7 @@
+{
+  "kernel_time": 257.0,
+  "baseline_eager_time": 7.88,
+  "baseline_compile_time": 8.36,
+  "speedup_vs_eager": 0.03066147859922179,
+  "speedup_vs_compile": 0.03252918287937743
+}
