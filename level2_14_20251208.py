@@ -15,34 +15,30 @@ using namespace nvcuda;
 #define WMMA_N 16
 #define WMMA_K 16
 
-// Block tile sizes
-#define BLOCK_TILE_M 128
-#define BLOCK_TILE_N 128
-#define BLOCK_TILE_K 32
+// Block tile sizes - reduced to fit in shared memory
+#define BLOCK_TILE_M 64
+#define BLOCK_TILE_N 64
+#define BLOCK_TILE_K 16
 
-// Warp configuration
-#define WARPS_M 4
-#define WARPS_N 4
+// Warp configuration - reduced to decrease register pressure
+#define WARPS_M 2
+#define WARPS_N 2
 #define NUM_THREADS (WARPS_M * WARPS_N * 32)
 
 // Shared memory padding to avoid bank conflicts
 #define SKEW_HALF 8
 
-__global__ void fused_gemm_reduce_kernel(
+__global__ void fused_gemm_kernel(
     const float* __restrict__ input,
     const float* __restrict__ weight,
-    float* __restrict__ output,
+    float* __restrict__ gemm_output,
     int batch_size,
     int input_size,
-    int hidden_size,
-    float scaling_factor
+    int hidden_size
 ) {
     // Shared memory for input and weight tiles
     __shared__ half A_smem[BLOCK_TILE_M][BLOCK_TILE_K + SKEW_HALF];
     __shared__ half B_smem[BLOCK_TILE_K][BLOCK_TILE_N + SKEW_HALF];
-    
-    // Shared memory for storing WMMA output fragments
-    __shared__ float C_smem[BLOCK_TILE_M][BLOCK_TILE_N + SKEW_HALF];
     
     const int warp_id = threadIdx.x / 32;
     const int lane_id = threadIdx.x % 32;
@@ -76,7 +72,6 @@ __global__ void fused_gemm_reduce_kernel(
         const int global_row_start = block_row * BLOCK_TILE_M;
         const int global_k_start = k_tile * BLOCK_TILE_K;
         
-        #pragma unroll
         for (int i = threadIdx.x; i < BLOCK_TILE_M * BLOCK_TILE_K; i += NUM_THREADS) {
             int local_row = i / BLOCK_TILE_K;
             int local_k = i % BLOCK_TILE_K;
@@ -94,7 +89,6 @@ __global__ void fused_gemm_reduce_kernel(
         // Weight is [hidden_size, input_size], we need transpose
         const int global_col_start = block_col * BLOCK_TILE_N;
         
-        #pragma unroll
         for (int i = threadIdx.x; i < BLOCK_TILE_K * BLOCK_TILE_N; i += NUM_THREADS) {
             int local_k = i / BLOCK_TILE_N;
             int local_col = i % BLOCK_TILE_N;
@@ -111,7 +105,6 @@ __global__ void fused_gemm_reduce_kernel(
         __syncthreads();
         
         // Perform WMMA operations
-        #pragma unroll
         for (int k_step = 0; k_step < BLOCK_TILE_K / WMMA_K; k_step++) {
             wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
             wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag;
@@ -134,15 +127,7 @@ __global__ void fused_gemm_reduce_kernel(
         __syncthreads();
     }
     
-    // Initialize C_smem to zero
-    for (int i = threadIdx.x; i < BLOCK_TILE_M * BLOCK_TILE_N; i += NUM_THREADS) {
-        int row = i / BLOCK_TILE_N;
-        int col = i % BLOCK_TILE_N;
-        C_smem[row][col] = 0.0f;
-    }
-    __syncthreads();
-    
-    // Store WMMA fragments properly to shared memory
+    // Store results directly to global memory
     #pragma unroll
     for (int i = 0; i < num_wmma_tiles_m; i++) {
         #pragma unroll
@@ -150,33 +135,43 @@ __global__ void fused_gemm_reduce_kernel(
             int frag_row = warp_row * num_wmma_tiles_m * WMMA_M + i * WMMA_M;
             int frag_col = warp_col * num_wmma_tiles_n * WMMA_N + j * WMMA_N;
             
-            // Store fragment to shared memory using proper WMMA store
-            wmma::store_matrix_sync(&C_smem[frag_row][frag_col], acc_frags[i][j], 
-                                   BLOCK_TILE_N + SKEW_HALF, wmma::mem_row_major);
-        }
-    }
-    
-    __syncthreads();
-    
-    // Perform reduction across columns for each row
-    // Each thread handles one or more rows
-    for (int row = threadIdx.x; row < BLOCK_TILE_M; row += NUM_THREADS) {
-        int global_row = block_row * BLOCK_TILE_M + row;
-        if (global_row < batch_size) {
-            float row_sum = 0.0f;
+            int global_row = block_row * BLOCK_TILE_M + frag_row;
+            int global_col = block_col * BLOCK_TILE_N + frag_col;
             
-            // Sum across all columns in this block tile
-            for (int col = 0; col < BLOCK_TILE_N; col++) {
-                int global_col = block_col * BLOCK_TILE_N + col;
-                if (global_col < hidden_size) {
-                    // Apply division by 2 during reduction
-                    row_sum += C_smem[row][col] * 0.5f;
+            if (global_row < batch_size && global_col < hidden_size) {
+                // Store fragment to global memory
+                float temp[WMMA_M * WMMA_N];
+                wmma::store_matrix_sync(temp, acc_frags[i][j], WMMA_N, wmma::mem_row_major);
+                
+                for (int ii = 0; ii < WMMA_M; ii++) {
+                    for (int jj = 0; jj < WMMA_N; jj++) {
+                        int gr = global_row + ii;
+                        int gc = global_col + jj;
+                        if (gr < batch_size && gc < hidden_size) {
+                            gemm_output[gr * hidden_size + gc] = temp[ii * WMMA_N + jj];
+                        }
+                    }
                 }
             }
-            
-            // Atomic add to global output with scaling factor
-            atomicAdd(&output[global_row], row_sum * scaling_factor);
         }
+    }
+}
+
+__global__ void reduce_and_scale_kernel(
+    const float* __restrict__ gemm_output,
+    float* __restrict__ output,
+    int batch_size,
+    int hidden_size,
+    float scaling_factor
+) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (row < batch_size) {
+        float sum = 0.0f;
+        for (int col = 0; col < hidden_size; col++) {
+            sum += gemm_output[row * hidden_size + col] * 0.5f; // Division by 2
+        }
+        output[row] = sum * scaling_factor;
     }
 }
 
@@ -189,20 +184,34 @@ torch::Tensor fused_gemm_reduce_cuda(
     const int input_size = input.size(1);
     const int hidden_size = weight.size(0);
     
+    // Allocate temporary buffer for GEMM output
+    auto gemm_output = torch::zeros({batch_size, hidden_size}, input.options());
     auto output = torch::zeros({batch_size, 1}, input.options());
     
-    dim3 threads(NUM_THREADS);
-    dim3 blocks(
+    // Launch GEMM kernel
+    dim3 gemm_threads(NUM_THREADS);
+    dim3 gemm_blocks(
         (hidden_size + BLOCK_TILE_N - 1) / BLOCK_TILE_N,
         (batch_size + BLOCK_TILE_M - 1) / BLOCK_TILE_M
     );
     
-    fused_gemm_reduce_kernel<<<blocks, threads>>>(
+    fused_gemm_kernel<<<gemm_blocks, gemm_threads>>>(
         input.data_ptr<float>(),
         weight.data_ptr<float>(),
-        output.data_ptr<float>(),
+        gemm_output.data_ptr<float>(),
         batch_size,
         input_size,
+        hidden_size
+    );
+    
+    // Launch reduction kernel
+    const int reduce_threads = 256;
+    const int reduce_blocks = (batch_size + reduce_threads - 1) / reduce_threads;
+    
+    reduce_and_scale_kernel<<<reduce_blocks, reduce_threads>>>(
+        gemm_output.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
         hidden_size,
         scaling_factor
     );
